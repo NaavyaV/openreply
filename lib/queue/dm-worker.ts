@@ -644,6 +644,30 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         );
       }
 
+      // Appreciation follow-up: only when this branch actually delivered the
+      // reveal directly (not the opening-DM or follow-prompt branches above,
+      // which hand the reveal off to a later postback tap instead).
+      if (
+        !useOpeningDm &&
+        !sendFollowPrompt &&
+        automation.followUpEnabled &&
+        automation.followUpMessage?.trim()
+      ) {
+        await getDMQueue().add(
+          FOLLOWUP_JOB_NAME,
+          {
+            instagramAccountId: automation.instagramAccount.instagramId,
+            userId: commenterId,
+            automationId: automation.id,
+            commenterName,
+          },
+          {
+            delay: Math.max(0, automation.followUpDelayMinutes ?? 0) * 60_000,
+            jobId: `followup_${automation.id}_${commenterId}`,
+          }
+        );
+      }
+
       await prisma.dmLog.update({
         where: {
           automationId_commentId: {

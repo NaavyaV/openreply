@@ -29,6 +29,10 @@ import { prisma } from "@/lib/db/client";
 import { commentJobId, getDMQueue } from "@/lib/queue/client";
 import { getActiveAutomationsForPoll } from "@/lib/polling/active-automations";
 import {
+  commentIdsDueForDb,
+  rememberSweepComments,
+} from "@/lib/polling/sweep-memory";
+import {
   getRecentMediaComments,
   getUserMedia,
   MetaApiError,
@@ -180,6 +184,22 @@ async function sweepCampaign(
     });
     if (needsAction.length === 0) continue;
 
+    // Neon already answered these on an earlier sweep. Handled comments stay
+    // skipped for the lookback window; anything still open is rechecked hourly
+    // so a failed send can be retried without waking Postgres every cycle.
+    let dueIds: string[];
+    try {
+      dueIds = await commentIdsDueForDb(
+        automation.id,
+        needsAction.map((c) => c.id)
+      );
+    } catch (error) {
+      stat.errors.push(`Sweep memory: ${errMessage(error)}`);
+      dueIds = needsAction.map((c) => c.id);
+    }
+    const due = needsAction.filter((c) => dueIds.includes(c.id));
+    if (due.length === 0) continue;
+
     // Second guard against races: skip comments this campaign has already fully
     // handled. "Fully handled" depends on the campaign: if it posts a public
     // reply, the completion signal is publicReplySentAt (a DM alone is not
@@ -189,7 +209,7 @@ async function sweepCampaign(
     const handled = await prisma.dmLog.findMany({
       where: {
         automationId: automation.id,
-        commentId: { in: needsAction.map((c) => c.id) },
+        commentId: { in: due.map((c) => c.id) },
         ...(automation.publicReplyEnabled
           ? { publicReplySentAt: { not: null } }
           : { status: "SENT" }),
@@ -197,9 +217,16 @@ async function sweepCampaign(
       select: { commentId: true },
     });
     const handledSet = new Set(handled.map((h) => h.commentId));
+    await rememberSweepComments(
+      automation.id,
+      [...handledSet],
+      due.map((c) => c.id)
+    ).catch((error) => {
+      stat.errors.push(`Sweep memory: ${errMessage(error)}`);
+    });
 
     // Oldest first, so whoever commented earliest gets answered first, capped.
-    const fresh = needsAction
+    const fresh = due
       .filter((c) => !handledSet.has(c.id))
       .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp))
       .slice(0, MAX_NEW_PER_SWEEP);
@@ -209,22 +236,28 @@ async function sweepCampaign(
       // comments sit waiting or delayed under this key; a sweep must not clone
       // them. Completed SENT rows are already filtered above. Failed jobs are
       // removed after a few minutes (removeOnFail), so a later sweep can retry.
-      await queue.add(
-        "process-comment",
-        {
-          instagramAccountId: account.instagramId,
-          commentId: c.id,
-          commentText: c.text ?? "",
-          commenterId: c.from!.id,
-          commenterName: c.from?.username,
-          mediaId,
-          source: "POLLING",
-        },
-        {
-          jobId: commentJobId(account.instagramId, c.id),
-        }
-      );
-      stat.enqueued += 1;
+      try {
+        await queue.add(
+          "process-comment",
+          {
+            instagramAccountId: account.instagramId,
+            commentId: c.id,
+            commentText: c.text ?? "",
+            commenterId: c.from!.id,
+            commenterName: c.from?.username,
+            mediaId,
+            source: "POLLING",
+          },
+          {
+            jobId: commentJobId(account.instagramId, c.id),
+          }
+        );
+        stat.enqueued += 1;
+      } catch (error) {
+        const message = errMessage(error);
+        if (/already exists|already waiting/i.test(message)) continue;
+        stat.errors.push(message);
+      }
     }
   }
 
@@ -235,16 +268,23 @@ async function recordSweep(
   workspaceId: string,
   stat: SweepStat
 ): Promise<void> {
-  // Only log when something happened or something went wrong.
   if (stat.enqueued === 0 && stat.errors.length === 0) return;
+
+  const message = `Comment sweep "${stat.campaign}" [${stat.keywords}]: ${stat.enqueued} enqueued, ${stat.matched} matched, ${stat.alreadyReplied} already replied`;
+  if (stat.errors.length === 0) {
+    // A normal catch-up is useful in the worker log. Writing it to Neon would
+    // keep Free compute awake for five minutes after every sweep that finds work.
+    console.log(`[Comment reconciler] ${message}`);
+    return;
+  }
 
   await prisma.operationalEvent
     .create({
       data: {
         workspaceId,
         source: "SYSTEM",
-        level: stat.errors.length > 0 ? "WARNING" : "INFO",
-        message: `Comment sweep "${stat.campaign}" [${stat.keywords}]: ${stat.enqueued} enqueued, ${stat.matched} matched, ${stat.alreadyReplied} already replied`,
+        level: "WARNING",
+        message,
         payload: { ...stat },
       },
     })

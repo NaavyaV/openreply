@@ -76,7 +76,7 @@ describe("active automations cache", () => {
       ACTIVE_AUTOMATIONS_CACHE_KEY,
       JSON.stringify(sample),
       "EX",
-      30 * 60
+      6 * 60 * 60
     );
   });
 

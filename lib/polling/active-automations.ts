@@ -14,7 +14,9 @@ import { getRedisConnection } from "@/lib/queue/client";
 import { prisma } from "@/lib/db/client";
 
 export const ACTIVE_AUTOMATIONS_CACHE_KEY = "cache:active-automations";
-const CACHE_TTL_SECONDS = 30 * 60;
+// Long on purpose. Neon Free bills ~5 minutes per wake, and this list only
+// changes when a campaign or token is saved (those paths delete the key).
+const CACHE_TTL_SECONDS = 6 * 60 * 60;
 
 export type PollerAutomation = {
   id: string;

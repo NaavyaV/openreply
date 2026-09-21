@@ -13,9 +13,18 @@ export function getRedisConnection(): Redis {
   if (!connection) {
     connection = new Redis(process.env.REDIS_URL!, {
       maxRetriesPerRequest: null, // Required by BullMQ
+      connectTimeout: 10_000,
+      keepAlive: 10_000,
     });
   }
   return connection;
+}
+
+export function commentJobId(
+  instagramAccountId: string,
+  commentId: string
+): string {
+  return `comment_${instagramAccountId}_${commentId}`;
 }
 
 // ─── DM Queue ───────────────────────────────────────────────────────────────────
@@ -83,15 +92,18 @@ export function getDMQueue(): Queue<DmQueueJob> {
     dmQueue = new Queue<DmQueueJob>("dm-processing", {
       connection: getRedisConnection(),
       defaultJobOptions: {
-        removeOnComplete: { count: 1000 }, // Keep last 1000 completed jobs
+        // Keep finished jobs briefly for debugging, then drop them so Redis
+        // stays under the free 30 MB cap during a viral drain and so the
+        // poller can re-enqueue a later retry of the same comment id.
+        removeOnComplete: { count: 200, age: 3600 },
         // Clear failed jobs shortly after they exhaust retries. Job ids are
         // deterministic (comment_<acct>_<id>), so a retained failed job would
         // block the polling reconciler from ever retrying that comment. Clearing
         // them lets a later sweep re-enqueue and try again once a transient
         // failure (e.g. an Instagram rate-limit window) has passed. Failure
         // detail is still preserved in DmLog.
-        removeOnFail: { age: 300, count: 2000 },
-        attempts: 3,
+        removeOnFail: { age: 300, count: 500 },
+        attempts: 5,
         backoff: {
           type: "custom",
         },

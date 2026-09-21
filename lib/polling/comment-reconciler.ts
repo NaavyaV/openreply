@@ -26,7 +26,8 @@
  */
 
 import { prisma } from "@/lib/db/client";
-import { getDMQueue } from "@/lib/queue/client";
+import { commentJobId, getDMQueue } from "@/lib/queue/client";
+import { getActiveAutomationsForPoll } from "@/lib/polling/active-automations";
 import {
   getRecentMediaComments,
   getUserMedia,
@@ -62,28 +63,7 @@ function errMessage(error: unknown): string {
 
 /** One reconciliation pass across every active campaign. */
 export async function reconcileComments(): Promise<void> {
-  const automations = await prisma.automation.findMany({
-    where: { isActive: true },
-    select: {
-      id: true,
-      name: true,
-      postId: true,
-      matchAnyPost: true,
-      matchAnyWord: true,
-      keywords: true,
-      wholeWordMatch: true,
-      publicReplyEnabled: true,
-      workspaceId: true,
-      instagramAccount: {
-        select: {
-          id: true,
-          instagramId: true,
-          username: true,
-          accessToken: true,
-        },
-      },
-    },
-  });
+  const automations = await getActiveAutomationsForPoll();
 
   const sinceMs = Date.now() - LOOKBACK_HOURS * 60 * 60 * 1000;
   const tokenCache = new Map<string, string | null>();
@@ -225,20 +205,25 @@ async function sweepCampaign(
       .slice(0, MAX_NEW_PER_SWEEP);
 
     for (const c of fresh) {
-      // No deterministic jobId here: a retained completed/failed job from an
-      // earlier sweep would otherwise be treated as a duplicate and silently
-      // drop this add, so the comment would never be retried. Dedup is handled
-      // above (owner-reply + DmLog guards) and the worker is idempotent
-      // (publicReplySentAt / SENT), so re-processing a comment is safe.
-      await queue.add("process-comment", {
-        instagramAccountId: account.instagramId,
-        commentId: c.id,
-        commentText: c.text ?? "",
-        commenterId: c.from!.id,
-        commenterName: c.from?.username,
-        mediaId,
-        source: "POLLING",
-      });
+      // Same id the webhook uses. During a viral hour thousands of matching
+      // comments sit waiting or delayed under this key; a sweep must not clone
+      // them. Completed SENT rows are already filtered above. Failed jobs are
+      // removed after a few minutes (removeOnFail), so a later sweep can retry.
+      await queue.add(
+        "process-comment",
+        {
+          instagramAccountId: account.instagramId,
+          commentId: c.id,
+          commentText: c.text ?? "",
+          commenterId: c.from!.id,
+          commenterName: c.from?.username,
+          mediaId,
+          source: "POLLING",
+        },
+        {
+          jobId: commentJobId(account.instagramId, c.id),
+        }
+      );
       stat.enqueued += 1;
     }
   }

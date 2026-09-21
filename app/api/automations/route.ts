@@ -10,6 +10,7 @@ import {
   canManageWorkspace,
   getCurrentWorkspaceContext,
 } from "@/lib/workspace-access";
+import { invalidateActiveAutomationsCache } from "@/lib/polling/active-automations";
 
 // This list is read-your-writes (created/imported campaigns must show up
 // immediately), so never cache it at the route or CDN layer.
@@ -439,6 +440,8 @@ export async function POST(request: NextRequest) {
     },
   });
 
+  await invalidateActiveAutomationsCache();
+
   return NextResponse.json(
     { success: true, data: automation },
     { status: 201 }
@@ -604,6 +607,8 @@ export async function PATCH(request: NextRequest) {
     }
   }
 
+  await invalidateActiveAutomationsCache();
+
   return NextResponse.json({ success: true, data: updated });
 }
 
@@ -645,6 +650,7 @@ export async function DELETE(request: NextRequest) {
   }
 
   await prisma.automation.delete({ where: { id: automationId } });
+  await invalidateActiveAutomationsCache();
 
   return NextResponse.json({ success: true, data: { deleted: true } });
 }

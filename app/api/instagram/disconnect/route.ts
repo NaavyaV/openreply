@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db/client";
+import { invalidateActiveAutomationsCache } from "@/lib/polling/active-automations";
 import {
   canManageWorkspace,
   getCurrentWorkspaceContext,
@@ -31,6 +32,7 @@ export async function POST(request: NextRequest) {
       ...(instagramAccountId ? { id: instagramAccountId } : {}),
     },
   });
+  await invalidateActiveAutomationsCache();
 
   return NextResponse.json({ success: true });
 }

@@ -13,6 +13,8 @@ const {
   mockMatchKeywords,
   mockReserveDMSlot,
   mockQueueAdd,
+  mockUpdateData,
+  mockMoveToDelayed,
   mockReserveWorkspaceDMSend,
   mockReleaseWorkspaceDMReservation,
 } = vi.hoisted(() => ({
@@ -46,6 +48,8 @@ const {
   mockMatchKeywords: vi.fn(),
   mockReserveDMSlot: vi.fn(),
   mockQueueAdd: vi.fn(),
+  mockUpdateData: vi.fn(),
+  mockMoveToDelayed: vi.fn(),
   mockReserveWorkspaceDMSend: vi.fn(),
   mockReleaseWorkspaceDMReservation: vi.fn(),
 }));
@@ -94,6 +98,8 @@ vi.mock("@/lib/utils/keyword-matcher", () => ({
 
 vi.mock("@/lib/utils/rate-limiter", () => ({
   reserveDMSlot: mockReserveDMSlot,
+  delayFromPttl: () => 60_000,
+  MAX_REQUEUE_ATTEMPTS: 72,
 }));
 
 vi.mock("@/lib/billing/usage", () => ({
@@ -115,6 +121,16 @@ vi.mock("@/lib/queue/client", () => ({
   MESSAGE_JOB_NAME: "process-message",
 }));
 
+const { DelayedError } = vi.hoisted(() => {
+  class DelayedError extends Error {
+    constructor(message = "Delayed Error") {
+      super(message);
+      this.name = "DelayedError";
+    }
+  }
+  return { DelayedError };
+});
+
 vi.mock("bullmq", () => {
   function MockWorker(_name: string, processor: unknown) {
     (global as Record<string, unknown>).__dmWorkerProcessor = processor;
@@ -125,10 +141,12 @@ vi.mock("bullmq", () => {
   }
   return {
     Worker: MockWorker,
+    DelayedError,
   };
 });
 
 import { createDMWorker } from "../lib/queue/dm-worker";
+import { RateLimitError } from "../lib/meta/client";
 
 const usagePeriodStart = new Date("2026-05-01T00:00:00.000Z");
 
@@ -190,6 +208,9 @@ function createMockJob(data: Record<string, unknown> = mockJobData) {
     data,
     id: "job_001",
     attemptsMade: 0,
+    token: "tok",
+    updateData: mockUpdateData,
+    moveToDelayed: mockMoveToDelayed,
   };
 }
 
@@ -411,7 +432,7 @@ describe("DM Worker — Full Pipeline", () => {
     );
   });
 
-  it("should requeue and release monthly usage when rate limited", async () => {
+  it("should park the same job when rate limited instead of cloning it", async () => {
     mockReserveDMSlot.mockResolvedValue({
       allowed: false,
       currentCount: 190,
@@ -423,24 +444,21 @@ describe("DM Worker — Full Pipeline", () => {
     });
 
     const processor = getProcessor();
-    await processor(createMockJob());
+    await expect(processor(createMockJob())).rejects.toThrow(DelayedError);
 
     expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledWith(
       "workspace_123",
       usagePeriodStart
     );
     expect(mockSendPrivateReply).not.toHaveBeenCalled();
-    expect(mockQueueAdd).toHaveBeenCalledWith(
-      "process-comment",
+    expect(mockUpdateData).toHaveBeenCalledWith(
       expect.objectContaining({
         commentId: "comment_555",
         requeueAttempt: 1,
-      }),
-      expect.objectContaining({
-        delay: 1800000,
-        jobId: "comment_ig_456_comment_555_retry_1",
       })
     );
+    expect(mockMoveToDelayed).toHaveBeenCalledWith(expect.any(Number), "tok");
+    expect(mockQueueAdd).not.toHaveBeenCalled();
   });
 
   it("should skip with SKIPPED_RATE_LIMIT after max requeue attempts", async () => {
@@ -492,6 +510,24 @@ describe("DM Worker — Full Pipeline", () => {
         errorMessage: "API Error",
       }),
     });
+  });
+
+  it("should park the job when Instagram throttles the send", async () => {
+    mockSendPrivateReply.mockRejectedValue(new RateLimitError("throttled"));
+
+    const processor = getProcessor();
+    await expect(processor(createMockJob())).rejects.toThrow(DelayedError);
+
+    expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledWith(
+      "workspace_123",
+      usagePeriodStart
+    );
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "PENDING" }),
+      })
+    );
+    expect(mockMoveToDelayed).toHaveBeenCalled();
   });
 
   it("should handle missing access token", async () => {

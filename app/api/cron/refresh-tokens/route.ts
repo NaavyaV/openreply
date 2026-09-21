@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db/client";
 import { decryptToken, encryptToken } from "@/lib/meta/oauth";
 import { refreshLongLivedToken } from "@/lib/meta/client";
+import { invalidateActiveAutomationsCache } from "@/lib/polling/active-automations";
 
 const DAYS_BEFORE_EXPIRY = 10;
 
@@ -95,6 +96,10 @@ export async function GET(request: NextRequest) {
         error: errorMessage,
       });
     }
+  }
+
+  if (results.some((result) => result.status === "refreshed")) {
+    await invalidateActiveAutomationsCache();
   }
 
   return NextResponse.json({

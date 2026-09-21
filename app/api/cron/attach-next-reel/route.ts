@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db/client";
 import { getUserMedia, type InstagramMedia } from "@/lib/meta/client";
 import { decryptToken } from "@/lib/meta/oauth";
+import { invalidateActiveAutomationsCache } from "@/lib/polling/active-automations";
 
 /**
  * Binds "next reel" campaigns to a real post.
@@ -86,6 +87,10 @@ export async function GET(request: NextRequest) {
       });
       bound += 1;
     }
+  }
+
+  if (bound > 0) {
+    await invalidateActiveAutomationsCache();
   }
 
   return NextResponse.json({

@@ -4,6 +4,7 @@ import { prisma } from "@/lib/db/client";
 import { getWorkspaceInstagramAccount } from "@/lib/instagram-accounts";
 import { generateReportShareSlug } from "@/lib/reports/share";
 import { generateTrackedLinkSlug } from "@/lib/tracking/server";
+import { invalidateActiveAutomationsCache } from "@/lib/polling/active-automations";
 import {
   canManageWorkspace,
   getCurrentWorkspaceContext,
@@ -121,6 +122,8 @@ export async function POST(request: NextRequest) {
     usedPostIds.add(campaign.postId);
     created.push({ name, postId: campaign.postId });
   }
+
+  await invalidateActiveAutomationsCache();
 
   return NextResponse.json({
     success: true,

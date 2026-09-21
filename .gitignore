@@ -43,3 +43,9 @@ next-env.d.ts
 
 /app/generated/prisma
 .gstack/
+
+# personal deployment notes (not for the public fork)
+DEPLOYMENT_NOTES.md
+
+# local CLI context (neonctl / railway)
+.neon/

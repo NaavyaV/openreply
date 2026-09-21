@@ -128,9 +128,13 @@ async function handleResponse<T>(response: Response): Promise<T> {
     switch (code) {
       case 190:
         throw new TokenExpiredError(message, traceId);
+      case 1:
+      case 2:
       case 368:
       case 4:
       case 17:
+        // 1/2 are Meta's "unknown" / "service" bursts — the usual signature of
+        // sending too many private replies at once, not a bad comment.
         throw new RateLimitError(message, traceId);
       case 10:
       case 100:

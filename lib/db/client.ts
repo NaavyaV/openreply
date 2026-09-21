@@ -11,8 +11,18 @@ function createPrismaClient() {
     throw new Error("DATABASE_URL environment variable is required");
   }
 
+  // Few connections, short idle: Neon Free suspends ~5 minutes after the last
+  // client disconnects (that delay cannot be shortened on Free). Drop idle
+  // sockets quickly so the 5-minute clock can start as soon as a sweep or
+  // webhook finishes.
   return new PrismaClient({
-    adapter: new PrismaPg(databaseUrl),
+    adapter: new PrismaPg({
+      connectionString: databaseUrl,
+      max: 2,
+      idleTimeoutMillis: 1_000,
+      connectionTimeoutMillis: 10_000,
+      allowExitOnIdle: true,
+    }),
   });
 }
 

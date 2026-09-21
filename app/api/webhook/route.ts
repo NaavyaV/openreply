@@ -1,6 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db/client";
-import { getDMQueue } from "@/lib/queue/client";
+import {
+  commentJobId,
+  getDMQueue,
+  MESSAGE_JOB_NAME,
+  POSTBACK_JOB_NAME,
+} from "@/lib/queue/client";
 import {
   parseCommentEvents,
   parseMessageEvents,
@@ -8,7 +13,6 @@ import {
   parseReadEvents,
   verifyWebhookSignature,
 } from "@/lib/meta/webhook";
-import { MESSAGE_JOB_NAME, POSTBACK_JOB_NAME } from "@/lib/queue/client";
 import { Prisma } from "@/app/generated/prisma/client";
 
 const OPENING_DM_READ_FALLBACK_DELAY_MS = 5 * 60 * 1000;
@@ -103,7 +107,7 @@ export async function POST(request: NextRequest) {
           source: "WEBHOOK",
         },
         {
-          jobId: `comment_${event.instagramAccountId}_${event.commentId}`,
+          jobId: commentJobId(event.instagramAccountId, event.commentId),
         }
       );
 

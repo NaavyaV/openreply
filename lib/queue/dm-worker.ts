@@ -1,4 +1,4 @@
-import { Worker, type Job } from "bullmq";
+import { DelayedError, Worker, type Job } from "bullmq";
 import {
   getDMQueue,
   getRedisConnection,
@@ -27,7 +27,11 @@ import {
 } from "@/lib/meta/client";
 import { decryptToken } from "@/lib/meta/oauth";
 import { matchKeywords } from "@/lib/utils/keyword-matcher";
-import { reserveDMSlot } from "@/lib/utils/rate-limiter";
+import {
+  MAX_REQUEUE_ATTEMPTS,
+  delayFromPttl,
+  reserveDMSlot,
+} from "@/lib/utils/rate-limiter";
 import {
   releaseWorkspaceDMReservation,
   reserveWorkspaceDMSend,
@@ -39,7 +43,42 @@ import {
   renderMessageWithoutLink,
 } from "@/lib/tracking/message";
 
-const BACKOFF_DELAYS = [5 * 60 * 1000, 15 * 60 * 1000, 45 * 60 * 1000];
+// Transient Meta failures (unknown/service bursts during a spike) wait longer
+// between tries so we do not hammer /messages and permanently FAIL the leftover.
+const BACKOFF_DELAYS = [
+  60 * 1000,
+  5 * 60 * 1000,
+  15 * 60 * 1000,
+  45 * 60 * 1000,
+  60 * 60 * 1000,
+];
+
+const WORKER_CONCURRENCY = Math.max(
+  1,
+  Number(process.env.WORKER_CONCURRENCY ?? 2)
+);
+// ~12 private replies per minute ≈ Meta's 750/hour, paced instead of a burst.
+const WORKER_MAX_PER_MINUTE = Math.max(
+  1,
+  Number(process.env.WORKER_MAX_PER_MINUTE ?? 12)
+);
+
+/**
+ * Park this comment in BullMQ delayed set. Same job id, no clone. DelayedError
+ * tells BullMQ this is not a failure, so attempts are not burned.
+ */
+async function parkCommentJob(
+  job: Job<ProcessCommentJob>,
+  delayMs: number
+): Promise<never> {
+  const nextAttempt = (job.data.requeueAttempt ?? 0) + 1;
+  await job.updateData({
+    ...job.data,
+    requeueAttempt: nextAttempt,
+  });
+  await job.moveToDelayed(Date.now() + delayMs, job.token);
+  throw new DelayedError();
+}
 
 function formatError(error: unknown): string {
   if (error instanceof MetaApiError) {
@@ -514,18 +553,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           },
         });
 
-        await getDMQueue().add(
-          "process-comment",
-          {
-            ...job.data,
-            requeueAttempt: requeueAttempt + 1,
-          },
-          {
-            delay: rateLimit.requeueDelayMs,
-            jobId: `comment_${instagramAccountId}_${commentId}_retry_${requeueAttempt + 1}`,
-          }
-        );
-        continue;
+        await parkCommentJob(job, rateLimit.requeueDelayMs);
       }
     }
 
@@ -686,6 +714,26 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         automation.workspaceId,
         usage.periodStart
       );
+
+      if (
+        error instanceof RateLimitError &&
+        requeueAttempt < MAX_REQUEUE_ATTEMPTS
+      ) {
+        await prisma.dmLog.update({
+          where: {
+            automationId_commentId: {
+              automationId: automation.id,
+              commentId,
+            },
+          },
+          data: {
+            status: "PENDING",
+            matchedKeyword: matchResult.matchedKeyword,
+            errorMessage: `Instagram throttled the send; retry scheduled (${formatError(error)})`,
+          },
+        });
+        await parkCommentJob(job, delayFromPttl(0, commentId));
+      }
 
       await prisma.dmLog.update({
         where: {
@@ -1274,7 +1322,11 @@ export function createDMWorker(): Worker<DmQueueJob> {
     processJob,
     {
       connection: getRedisConnection(),
-      concurrency: 5,
+      concurrency: WORKER_CONCURRENCY,
+      limiter: {
+        max: WORKER_MAX_PER_MINUTE,
+        duration: 60_000,
+      },
       settings: {
         backoffStrategy: (attemptsMade: number) =>
           BACKOFF_DELAYS[Math.min(attemptsMade - 1, BACKOFF_DELAYS.length - 1)],
@@ -1287,6 +1339,7 @@ export function createDMWorker(): Worker<DmQueueJob> {
   });
 
   worker.on("failed", (job, err) => {
+    if (err instanceof DelayedError) return;
     console.error(
       `[DM Worker] Job ${job?.id} failed (attempt ${job?.attemptsMade}):`,
       err.message
